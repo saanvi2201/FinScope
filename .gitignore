@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Data outputs (VERY IMPORTANT)
+data/processed_docs/
+data/logs/
+data/needs_review/
+
+# Vector DB (later)
+rag/vector_store/
+
+# OS files
+.DS_Store
+Thumbs.db
