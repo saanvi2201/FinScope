@@ -1,66 +1,72 @@
-# Credit Card Document Preprocessing Pipeline
+# Credit Card Document Preprocessing Pipeline (Hybrid Rule + LLM)
 
-A rule-based, explainable Python pipeline for cleaning, classifying, renaming,
-and organising raw credit card PDF documents into a structured dataset.
+A production-grade pipeline for classifying, renaming, and organising raw credit card PDF documents into a structured dataset ready for downstream Agentic RAG systems.
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
-2. [Features](#2-features)
+2. [Role in the Agentic RAG System](#2-role-in-the-agentic-rag-system)
 3. [Folder Structure](#3-folder-structure)
-4. [Setup Instructions](#4-setup-instructions-windows--vs-code)
+4. [Setup Instructions](#4-setup-instructions)
 5. [How to Run](#5-how-to-run)
-6. [How Files Are Named](#6-how-files-are-named)
-7. [Classification Logic](#7-classification-logic)
-8. [Master / Collective Document Handling](#8-master--collective-document-handling)
-9. [Confidence & Reason System](#9-confidence--reason-system)
-10. [Adaptive Page Reading](#10-adaptive-page-reading)
-11. [Logs Explained](#11-logs-explained)
-12. [Document Coverage Validation](#12-document-coverage-validation)
-13. [The `needs_review` Folder](#13-the-needs_review-folder)
-14. [How to Modify Rules](#14-how-to-modify-rules)
-15. [Troubleshooting](#15-troubleshooting)
+6. [How Classification Works](#6-how-classification-works)
+7. [Metadata JSON Format](#7-metadata-json-format)
+8. [Logs Explained](#8-logs-explained)
+9. [Common Errors and Fixes](#9-common-errors-and-fixes)
+10. [Troubleshooting Guide](#10-troubleshooting-guide)
 
 ---
 
 ## 1. Project Overview
 
-This pipeline takes messy, unstructured PDF files from a raw documents folder and:
+This pipeline takes a folder of raw, unorganised credit card PDF files and:
 
-- Extracts text from the first few pages of each PDF
-- Detects the document type (MITC, TNC, BR, LG), bank name, and card name
-- Handles collective/master documents that apply to all cards for a bank
-- Renames each file to a clean, consistent format using bank short codes
-- Organises files into labelled subfolders
-- Routes uncertain files to a separate review folder
-- Validates that every expected card has its required documents after processing
-- Generates detailed logs and CSV reports for auditing
-
-The system is fully rule-based and deterministic — no machine learning is involved.
-Every decision is logged with a human-readable explanation.
+- Extracts text from each PDF (with OCR fallback for scanned documents)
+- Detects the **bank name**, **card name**, and **document type** (MITC / TNC / BR / LG)
+- Handles **master/collective documents** that apply to all cards for a bank
+- Applies a **hybrid classification approach**: fast rule-based detection first, LLM fallback only when needed
+- Renames each file to a clean, consistent format: `BANK_CARD_DOCTYPE_YEAR.pdf`
+- Organises files into labelled subfolders under `processed_docs/`
+- Routes uncertain files to `needs_review/` for manual review
+- Generates a **metadata JSON** alongside every processed PDF for use by the RAG system
+- Validates dataset completeness and reports missing documents per card
 
 ---
 
-## 2. Features
+## 2. Role in the Agentic RAG System
 
-| Feature | Description |
-|---|---|
-| Text extraction | Supports pdfplumber and PyMuPDF (auto-fallback) |
-| Adaptive page reading | Reads 3 → 5 → 10 pages progressively, stops early when confident |
-| Bank alias mapping | Maps full bank names to short codes for clean filenames |
-| Document type detection | Title/header matching + keyword frequency scoring |
-| Card detection | Text search with ordering rules for overlapping names |
-| Master doc detection | Identifies collective bank-wide docs, routes to `BANK_MASTER/` folder |
-| Confidence scoring | Weighted 0–1 score with explainable reasons per file |
-| Coverage validation | Checks every expected card has MITC + BR after processing |
-| Missing docs report | Generates `missing_docs_report.csv` with COMPLETE/PARTIAL/CRITICAL/NOT_FOUND status |
-| Dry-run mode | Preview all actions without touching any files |
-| Debug mode | Print extracted text samples for diagnosing detection failures |
-| Duplicate detection | Skip files that already exist at the destination |
-| CSV summary | One-row-per-file summary with `Is_Master` column for easy filtering |
-| Detailed log | Full per-file audit trail in plain text including master doc reasoning |
+This pipeline is Stage 1 in the full system:
+
+```
+RAW PDFs
+  ↓
+[Stage 1: THIS PIPELINE]  ← You are here
+  ↓
+CLEAN DOCUMENT LIBRARY + METADATA JSON
+  ↓
+[Stage 2: RAG Indexing]
+  ↓
+VECTOR DATABASE (FAISS / Chroma)
+  ↓
+[Stage 3: Knowledge Extraction]
+  ↓
+STRUCTURED RULES (card_rules.json)
+  ↓
+[Stage 4: User Profiling + Simulation]
+  ↓
+[Stage 5: Agentic Recommendation]
+  ↓
+[Stage 6: Validation]
+```
+
+**Why preprocessing matters:** The RAG system's accuracy depends entirely on correctly classified, consistently named documents. If a MITC document is stored as TNC, the simulation engine will look in the wrong place for fee information and produce wrong recommendations. This pipeline ensures every document is correctly identified before it enters the knowledge base.
+
+**The `data_quality` field** in metadata tells downstream agents whether a card's document set is complete enough to make a reliable recommendation:
+- `"complete"` — both MITC and BR are present → agent can recommend
+- `"partial"` — one required doc is missing → agent should flag uncertainty
+- `"insufficient"` — no required docs → agent must refuse to recommend
 
 ---
 
@@ -73,701 +79,519 @@ project_root/
 │   ├── raw_docs/                ← Place your input PDFs here (never modified)
 │   │
 │   ├── processed_docs/          ← Organised output (created automatically)
-│   │   ├── HDFC_Millennia/      ← One subfolder per bank+card combination
-│   │   │   ├── HDFC_Millennia_MITC_2024.pdf
-│   │   │   └── HDFC_Millennia_BR_2024.pdf
-│   │   ├── BOB_Eterna/
-│   │   │   └── BOB_Eterna_MITC_2024.pdf
-│   │   └── HDFC_MASTER/         ← Collective/bank-wide docs go here
-│   │       ├── HDFC_MASTER_MITC_2024.pdf
-│   │       └── HDFC_MASTER_TNC_2024.pdf
+│   │   ├── HDFC_Millennia/
+│   │   │   ├── HDFC_Millennia_MITC_2026.pdf
+│   │   │   ├── HDFC_Millennia_MITC_2026.json   ← metadata for RAG
+│   │   │   └── HDFC_Millennia_BR_2026.pdf
+│   │   ├── SBI_Cashback/
+│   │   └── HDFC_MASTER/         ← Bank-wide collective documents
+│   │       └── HDFC_MASTER_MITC_2026.pdf
 │   │
-│   ├── needs_review/            ← Low-confidence or incomplete detections
+│   ├── needs_review/            ← Low-confidence files for manual check
 │   │
 │   └── logs/
-│       ├── summary.csv              ← One-row-per-file processing summary
-│       ├── preprocess_log.txt       ← Detailed per-file audit trail
-│       └── missing_docs_report.csv  ← Coverage gaps per expected card
+│       ├── summary.csv                    ← One row per file
+│       ├── preprocess_log.txt             ← Full per-file audit trail
+│       ├── hybrid_classification_log.txt  ← LLM decision details
+│       ├── missing_docs_report.csv        ← Coverage gaps per card
+│       └── coverage_dashboard.xlsx        ← Visual Excel grid
 │
 └── data_pipeline/
-    └── preprocess.py            ← Main script (all config at the top)
+    ├── preprocess.py              ← Rule-based core (do not modify)
+    ├── preprocess_with_llm.py     ← Hybrid pipeline (entry point)
+    └── llm_classifier.py          ← LLM classification module
 ```
 
-> Raw files in `raw_docs/` are **never deleted or modified**.
-> The script only copies files to destination folders.
+> Raw files in `raw_docs/` are **never deleted or modified**. The pipeline only copies files to destinations.
 
 ---
 
-## 4. Setup Instructions (Windows + VS Code)
+## 4. Setup Instructions
 
-### Prerequisites
+### Step 1 — Python version
 
-- Python 3.10 or higher
-- VS Code with the Python extension installed
-
-### Step 1 — Place the project folder
-
-Put the project anywhere on your machine, for example:
-
-```
-C:\Users\YourName\projects\credit_card_pipeline\
-```
-
-### Step 2 — Open a terminal in VS Code
-
-Press `` Ctrl + ` `` (backtick) to open the integrated terminal.
-
-### Step 3 — Create a virtual environment (recommended)
+You need **Python 3.10 or higher**.
 
 ```bash
+python --version
+```
+
+### Step 2 — Create a virtual environment (recommended)
+
+```bash
+# Windows
 python -m venv venv
 venv\Scripts\activate
+
+# macOS / Linux
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-This keeps project packages isolated from the rest of your Python installation.
-Once activated, your terminal prompt will show `(venv)`.
-
-### Step 4 — Install dependencies
+### Step 3 — Install core Python dependencies
 
 ```bash
-pip install pdfplumber pandas
+pip install pdfplumber pymupdf requests pandas openpyxl
 ```
 
-Or if you prefer PyMuPDF:
+| Package | Purpose |
+|---|---|
+| `pdfplumber` | Primary PDF text extraction |
+| `pymupdf` | Fallback PDF text extraction + OCR page rendering |
+| `requests` | HTTP calls to Ollama API |
+| `pandas` | CSV and Excel report generation |
+| `openpyxl` | Excel coverage dashboard |
+
+### Step 4 — Install OCR dependencies (optional)
+
+Only needed if you have scanned (image-only) PDFs that contain no embedded text.
 
 ```bash
-pip install pymupdf pandas
+pip install pytesseract Pillow
 ```
 
-You only need **one** PDF library. The script tries pdfplumber first, then falls back to PyMuPDF automatically.
+Then install the **Tesseract binary**:
 
-### Step 5 — Place your PDF files
+**Windows:**
+1. Download the installer from: https://github.com/UB-Mannheim/tesseract/wiki
+2. Run the `.exe` and complete the wizard
+3. The pipeline automatically looks for Tesseract at: `C:\Program Files\Tesseract-OCR\tesseract.exe`
+4. If you installed it somewhere else, open `preprocess_with_llm.py`, find the line `TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"` and update the path
 
-Copy your raw PDF files into:
-
+**macOS:**
+```bash
+brew install tesseract
 ```
-project_root\data\raw_docs\
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install tesseract-ocr
 ```
+
+### Step 5 — Install Ollama and pull Mistral
+
+Ollama runs the LLM locally. No API key needed. No data leaves your machine.
+
+**Install Ollama:**
+
+```bash
+# macOS / Linux
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Windows
+# Download from: https://ollama.ai/download
+# Run the installer (.exe) and follow the wizard
+```
+
+**Pull the Mistral model** (~4.1 GB, one-time download):
+
+```bash
+ollama pull mistral
+```
+
+**Start the Ollama server:**
+
+```bash
+ollama serve
+```
+
+Keep this terminal open while the pipeline runs. On most systems, Ollama starts automatically at boot after installation.
+
+**Verify Mistral is working:**
+
+```bash
+ollama run mistral "say hello"
+```
+
+You should see a short text response within 30 seconds on CPU, under 5 seconds on GPU.
 
 ---
 
 ## 5. How to Run
 
-All commands are run from `project_root/`.
+All commands are run from the **project root folder** (the folder that contains `data/`).
 
-### Normal run
-
-```bash
-python data_pipeline\preprocess.py
-```
-
-### Dry-run mode — no files are copied, only logged
+### Normal run — full pipeline with LLM fallback
 
 ```bash
-python data_pipeline\preprocess.py --dry-run
+python data_pipeline/preprocess_with_llm.py
 ```
 
-Use this first to preview everything the pipeline would do before committing.
+This is the recommended command. The LLM is called only for low-confidence documents.
 
-### Debug mode — prints extracted text for each PDF
+### Rules only — no LLM, no Ollama needed
 
 ```bash
-python data_pipeline\preprocess.py --debug
+python data_pipeline/preprocess_with_llm.py --no-llm
 ```
 
-Prints the first ~600 characters of extracted text per file. Use this to diagnose
-why a file is going to `needs_review/` or getting the wrong classification.
+Use this for fast testing or when Ollama is not available. Low-confidence documents go to `needs_review/` instead of being sent to the LLM.
 
-### Combined
+### Dry run — simulate everything, move nothing
 
 ```bash
-python data_pipeline\preprocess.py --dry-run --debug
+python data_pipeline/preprocess_with_llm.py --dry-run
 ```
 
-> **PowerShell users:** If running `python` opens the Microsoft Store instead of running the script, use `py` instead: `py data_pipeline\preprocess.py`
+Run this first to see what the pipeline *would* do without actually copying any files. Safe to run multiple times.
+
+### Debug mode — print extracted text for each PDF
+
+```bash
+python data_pipeline/preprocess_with_llm.py --debug
+```
+
+Prints the first ~600 characters of extracted text from each PDF. Use this when a file goes to `needs_review/` and you want to see what text was actually extracted.
+
+### Combine flags
+
+```bash
+python data_pipeline/preprocess_with_llm.py --dry-run --debug
+python data_pipeline/preprocess_with_llm.py --no-llm --dry-run
+```
+
+### Test LLM in isolation
+
+```bash
+python data_pipeline/llm_classifier.py
+```
+
+Runs 4 built-in test cases and shows pass/fail. Use this to verify Ollama is configured correctly before running the full pipeline.
 
 ---
 
-## 6. How Files Are Named
+## 6. How Classification Works
 
-Every processed file follows this exact format:
+### Overview
 
 ```
-[BANK_SHORT_CODE]_[CARD_NAME]_[DOCTYPE]_[YEAR].pdf
+PDF text
+  ↓
+[STEP 1] Text extraction: pdfplumber → PyMuPDF → OCR (if both fail)
+  ↓
+[STEP 2] Rule-based detection (fast, deterministic)
+         detect_bank() + detect_card() + detect_doc_type() + detect_master_doc()
+         ↓
+         Bank-specific card narrowing (FIX #2)
+         If card doesn't belong to detected bank → re-scan for correct card
+  ↓
+[STEP 3] LLM trigger check
+         Call LLM if: confidence<0.70 OR bank=UNKNOWN OR card=UNKNOWN OR doc_type=UNKNOWN
+         ↓
+         classify_with_llm() → Mistral via Ollama
+         apply_llm_override() → LLM wins only if conf > rule_conf + 0.10
+         Master doc protection → LLM can NEVER override is_master=True
+  ↓
+[STEP 4] Output: PDF copy + metadata JSON + logs
 ```
-
-| Part | Source | Example |
-|---|---|---|
-| `BANK_SHORT_CODE` | Key from `BANK_ALIASES` in config | `BOB`, `SCB`, `HDFC` |
-| `CARD_NAME` | Match from `CARDS` list (spaces → underscores) | `Eterna`, `Amazon_Pay` |
-| `DOCTYPE` | Detected doc type | `MITC`, `TNC`, `BR`, `LG` |
-| `YEAR` | Extracted from PDF text, or `DEFAULT_YEAR` | `2024` |
-
-### Regular card examples
-
-| Input PDF (messy name) | Output filename |
-|---|---|
-| `bank_of_baroda_doc.pdf` | `BOB_Eterna_MITC_2024.pdf` |
-| `stanchart_smart.pdf` | `SCB_Smart_BR_2024.pdf` |
-| `hdfc_tata.pdf` | `HDFC_Tata_Neu_Infinity_BR_2025.pdf` |
-| `icici_amazon.pdf` | `ICICI_Amazon_Pay_TNC_2023.pdf` |
-
-### Why short codes instead of full bank names?
-
-The PDF text might say "Bank of Baroda" or "Standard Chartered Bank" in full.
-`BANK_ALIASES` maps those full phrases to clean short codes for filenames.
-This is entirely configurable — see [How to Modify Rules](#14-how-to-modify-rules).
-
-### Master document examples
-
-Collective/bank-wide documents get `MASTER` as the card name:
-
-| Scenario | Output filename | Output folder |
-|---|---|---|
-| HDFC common MITC (all cards) | `HDFC_MASTER_MITC_2024.pdf` | `processed_docs/HDFC_MASTER/` |
-| SBI collective TNC | `SBI_MASTER_TNC_2024.pdf` | `processed_docs/SBI_MASTER/` |
-
----
-
-## 7. Classification Logic
 
 ### Document Types
 
-| Code | Full Name | Description |
+| Code | Full Name | Signals |
 |---|---|---|
-| `MITC` | Most Important Terms & Conditions | Fee schedules, interest rates, charges |
-| `TNC` | Terms and Conditions | Legal agreement, dispute resolution |
-| `BR` | Benefits & Rewards | Cashback, points, welcome bonuses |
-| `LG` | Lounge Guide | Airport lounge access details |
+| `MITC` | Most Important Terms & Conditions | Fees, interest rate, annual fee, schedule of charges |
+| `TNC` | Terms and Conditions | Cardmember agreement, governing law, exclusions |
+| `BR` | Benefits & Rewards | Cashback, reward points, welcome bonus, earn rate |
+| `LG` | Lounge Guide | Airport lounge, priority pass, domestic lounge |
 
-### Layer 1 — Title / Header Detection
+**Priority order:** MITC → TNC → BR → LG. When signals from multiple types appear (e.g. a MITC that mentions "terms and conditions" in its body), MITC always wins.
 
-The script examines the **first 500 characters** of the extracted text, where the document title usually appears.
+### Master Documents
 
-If it finds an exact phrase such as:
-- `"Most Important Terms"` → classified as **MITC**
-- `"Terms and Conditions"` → classified as **TNC**
-- `"Benefits Guide"` → classified as **BR**
-- `"Lounge Access Guide"` → classified as **LG**
+Some banks publish a single document that applies to ALL their credit cards (e.g. HDFC's common MITC). These are detected before card detection runs. When found:
+- Card name is set to `"MASTER"` (never a specific card name)
+- File is placed in `processed_docs/HDFC_MASTER/`
+- The LLM can **never** override this — master classification is permanent once detected
 
-A title match gives a strong confidence boost (+10 percentage points on top of keyword score).
+### Confidence Scoring
 
-### Layer 2 — Keyword Frequency Scoring
+Overall confidence is a weighted average:
+- Doc type: 50%
+- Bank: 30%
+- Card: 20%
 
-The script counts how many keywords from each document type's dictionary appear in the extracted text.
-
-For example, a document containing `interest rate`, `annual fee`, `late payment fee`, and `minimum amount due` scores highly for **MITC**.
-
-Each type has its own keyword list in the config (`MITC_KEYWORDS`, `TNC_KEYWORDS`, etc.). Scores are normalised 0–1. The highest-scoring type wins. If a title match and keyword scores agree, confidence is high. If they disagree, the title match takes priority.
-
-### Bank Detection
-
-The script searches for phrases listed in `BANK_ALIASES`. When a phrase matches, the **short code key** is used in the filename — not the full phrase. For example, finding "Bank of Baroda" in the text results in `BOB` in the filename.
-
-Detection checks the **header zone** (first 500 characters) first, giving a confidence of 0.95. Matches deeper in the body give 0.80. If text search fails, the original filename is searched as a fallback (confidence 0.55).
-
-### Card Detection
-
-The `CARDS` list is scanned top-to-bottom. The first match found is used.
-
-**Ordering matters:** if a card name contains another card name, the more specific one must be listed first. For example, `"Platinum Travel"` must appear before `"Platinum"` to avoid a Platinum Travel document being matched as just "Platinum".
+Files below 0.70 go to `needs_review/` (or get the LLM fallback).
 
 ---
 
-## 8. Master / Collective Document Handling
+## 7. Metadata JSON Format
 
-Some banks publish a single document that legally applies to **all** their credit cards rather than issuing one per card variant. For example, HDFC publishes one common MITC covering Infinia, Millennia, Regalia, and every other variant.
-
-### Why this matters
-
-Without special handling, a collective HDFC MITC would either:
-- Wrongly match the first card name it finds in the text (e.g. "Infinia"), OR
-- Fail card detection and land in `needs_review/` with `UNKNOWN_CARD`
-
-Both outcomes are wrong. The master doc system prevents this.
-
-### How it works
-
-1. After bank detection, the text is scanned for phrases in `MASTER_DOC_SIGNALS` **before** card detection runs
-2. If any signal phrase is found, card name is set to `"MASTER"` and individual card detection is skipped entirely
-3. The file is placed in a dedicated `BANK_MASTER/` folder
-
-### Signal phrase examples
+Every processed PDF gets a `.json` file with the same base name:
 
 ```
-"applicable to all credit cards"
-"all hdfc bank credit cards"
-"irrespective of the card variant"
-"common terms and conditions"
+HDFC_Millennia_MITC_2026.pdf
+HDFC_Millennia_MITC_2026.json  ← this file
 ```
 
-### Output
+Example content:
 
+```json
+{
+  "bank": "HDFC",
+  "card": "Millennia",
+  "doc_type": "MITC",
+  "is_master": false,
+  "confidence": 0.9125,
+  "classification_source": "rule_based",
+  "source_file": "hdfc_millennia_doc.pdf",
+  "output_file": "HDFC_Millennia_MITC_2026.pdf",
+  "llm_reason": null,
+  "data_quality": "complete",
+  "processing_timestamp": "2026-03-26T14:30:00"
+}
 ```
-Detected signal: "all hdfc bank credit cards"
-Filename:  HDFC_MASTER_MITC_2024.pdf
-Folder:    processed_docs/HDFC_MASTER/
-Status:    MASTER_DOC
-```
 
-### Coverage validation for master docs
+**Field reference:**
 
-Master docs are tracked in `EXPECTED_CARDS` just like individual cards:
+| Field | Values | Meaning |
+|---|---|---|
+| `bank` | `HDFC`, `SBI`, etc. | Short bank code |
+| `card` | `Millennia`, `MASTER`, etc. | Card product name |
+| `doc_type` | `MITC`, `TNC`, `BR`, `LG` | Document category |
+| `is_master` | `true` / `false` | Whether this is a bank-wide collective document |
+| `confidence` | `0.0` – `1.0` | Classification confidence |
+| `classification_source` | `rule_based` / `llm` | Which system provided the final result |
+| `llm_reason` | string or `null` | LLM's one-sentence explanation (only when `classification_source=llm`) |
+| `data_quality` | `complete`, `partial`, `insufficient` | Whether required docs (MITC + BR) are available for this card |
+| `processing_timestamp` | ISO 8601 | When this file was processed |
 
-```python
-"HDFC MASTER",   # HDFC's collective doc
-"SBI MASTER",    # SBI's collective doc
-```
-
-If a bank's master document hasn't been processed, the coverage report will flag it as `CRITICAL`.
-
-### Adding new signal phrases
-
-In `preprocess.py`, find `MASTER_DOC_SIGNALS` and add a new line:
-
-```python
-MASTER_DOC_SIGNALS = [
-    "applicable to all credit cards",
-    "your new phrase here",   # ← add here
-]
-```
+The RAG system reads these JSON files during vector DB indexing to attach metadata to each text chunk.
 
 ---
 
-## 9. Confidence & Reason System
-
-Every detection (bank, card, doc type) produces three values:
-
-```
-value      → what was detected    e.g. "MITC", "HDFC", "Millennia"
-confidence → how certain (0–1)    e.g. 0.91
-reasons    → why this decision    e.g. ['Found "Most Important Terms" in header']
-```
-
-### Overall Confidence
-
-The overall file confidence is a weighted average of the three individual scores:
-
-| Component | Weight |
-|---|---|
-| Document type | 50% |
-| Bank name | 30% |
-| Card name | 20% |
-
-If the overall confidence falls below **0.70**, the file is routed to `needs_review/`.
-
-### Example log output for a regular file
-
-```
-BANK: HDFC (0.95)
-REASONS:
-  • Found 'hdfc bank' → mapped to short code 'HDFC' in header
-
-MASTER / COLLECTIVE DOCUMENT: NO
-  No collective signals found — proceeded with individual card detection.
-
-CARD: Millennia (0.90)
-REASONS:
-  • Found 'Millennia' in document header
-
-DOC TYPE: MITC (0.91)
-REASONS:
-  • Found title phrase "most important terms" in document header
-  • Keyword matches for MITC: interest rate, annual fee, late payment fee
-  • Low presence of BR-related keywords (score=0.05)
-```
-
-### Example log output for a master document
-
-```
-BANK: HDFC (0.95)
-REASONS:
-  • Found 'hdfc bank' → mapped to short code 'HDFC' in header
-
-MASTER / COLLECTIVE DOCUMENT: YES
-  Trigger signal : "all hdfc bank credit cards"
-  Confidence     : 0.92
-  Decision       : Individual card detection was SKIPPED.
-                   Card name set to MASTER.
-  Destination    : processed_docs/HDFC_MASTER/
-
-CARD: MASTER (0.92)
-REASONS:
-  • MASTER DOCUMENT — applies to all cards for this bank
-  • Trigger signal: "all hdfc bank credit cards"
-  • Individual card detection was intentionally skipped
-```
-
----
-
-## 10. Adaptive Page Reading
-
-Instead of reading the entire PDF (slow), the script reads pages progressively:
-
-```
-Tier 1: Read first 3 pages → run detection
-         If confidence ≥ 0.70 → STOP (fast path)
-
-Tier 2: Read first 5 pages → re-run detection
-         If confidence ≥ 0.70 → STOP
-
-Tier 3: Read first 10 pages → final detection
-         Hard maximum — never reads the whole PDF
-```
-
-This also applies to master doc detection — if the collective signal is on page 4, Tier 2 will catch it.
-
-### Log messages for fallback
-
-```
-[INFO] Extracting text (3 pages) from: doc1.pdf
-[INFO] Confidence after 3 pages: 0.52 | HDFC | None | MITC
-[INFO] Confidence 0.52 below threshold 0.70. Retrying with 5 pages...
-[INFO] Extracting text (5 pages) from: doc1.pdf
-[INFO] Confidence improved to 0.81 after reading 5 pages.
-```
-
-### Configuring the page tiers
-
-In `preprocess.py`:
-
-```python
-PAGE_TIERS = [3, 5, 10]       # default
-PAGE_TIERS = [2, 4, 8]        # read fewer pages (faster, less thorough)
-PAGE_TIERS = [5, 10, 20]      # read more pages (slower, more thorough)
-```
-
----
-
-## 11. Logs Explained
+## 8. Logs Explained
 
 ### `summary.csv`
 
-A spreadsheet-friendly one-row-per-file summary. Open in Excel or Google Sheets.
+One row per file. Columns: File Name, Bank, Card, Is_Master, DocType, Confidence, Reason, Status.
 
-| Column | Description |
-|---|---|
-| File Name | Original filename from `raw_docs/` |
-| Bank | Detected bank short code (e.g. `BOB`, `HDFC`) |
-| Card | Detected card name, or `MASTER` for collective docs |
-| Is_Master | `YES` if this is a collective/bank-wide document, `NO` otherwise |
-| DocType | Detected document type (`MITC`, `TNC`, `BR`, `LG`) |
-| Confidence | Overall confidence score (0–1) |
-| Reason | Top reasons for the classification decision |
-| Status | `SUCCESS`, `MASTER_DOC`, `NEEDS_REVIEW`, `ERROR`, `DUPLICATE_SKIPPED` |
-
-**Useful filters in Excel:**
-- Filter `Is_Master = YES` to see all collective documents
-- Filter `Status = NEEDS_REVIEW` to find files needing manual attention
-- Filter `Status = ERROR` to find files that crashed during processing
+Open in Excel to filter by Status = `NEEDS_REVIEW` or `ERROR` to quickly find problem files.
 
 ### `preprocess_log.txt`
 
-A detailed plain-text audit trail. For every file it records:
+Full per-file audit trail. For each file shows:
+- Bank detection result + confidence + reason
+- Whether master doc detection fired and why
+- Card detection result + confidence + reason
+- Doc type detection result + confidence + reason
+- Pages read, final status
 
-- **Bank** — detected short code, confidence score, and exact phrase matched
-- **Master doc check** — whether a collective signal was found, what phrase triggered it, and what decision was made (skip card detection or proceed normally)
-- **Card** — detected card name, confidence, and where it was found
-- **Doc type** — classification with keyword evidence
-- **Pages read** — how many pages were needed (shows if fallback tiers were used)
-- **Status** — final outcome
+### `hybrid_classification_log.txt`
 
-This log is the primary tool for understanding why any file was classified as it was.
+Only files where the LLM was called. Shows the rule result, LLM result, and which one won. Use this to tune the `LLM_OVERRIDE_MARGIN` if LLM overrides are too aggressive or too conservative.
 
 ### `missing_docs_report.csv`
 
-Generated after all files are processed. One row per expected card.
+After all files are processed, this checks every expected card against a list of required documents. Statuses:
+- `COMPLETE` — MITC and BR both found
+- `PARTIAL` — required docs present, optional (TNC, LG) missing
+- `CRITICAL` — one or more required docs (MITC or BR) missing
+- `NOT_FOUND` — no documents found for this card at all
 
-| Column | Description |
-|---|---|
-| Card | Expected card (e.g. `HDFC Millennia`, `HDFC MASTER`) |
-| Present_Docs | Doc types successfully processed (e.g. `BR, MITC`) |
-| Missing_Docs | Doc types absent (e.g. `TNC, LG`) |
-| Status | `COMPLETE`, `PARTIAL`, `CRITICAL`, or `NOT_FOUND` |
+### `coverage_dashboard.xlsx`
 
----
+Visual colour-coded grid: rows = cards, columns = doc types. Green = found, red = missing required, yellow = missing optional. Use this to quickly see which cards need more documents before the RAG system is ready.
 
-## 12. Document Coverage Validation
+### Console output tags
 
-This step runs **automatically after all files are processed**. It is read-only — it does not move or modify any files.
-
-### What it does
-
-1. Scans all successfully processed files and builds a coverage map: `"HDFC Millennia" → {MITC, BR}`
-2. Compares every entry in `EXPECTED_CARDS` against `REQUIRED_DOCS`
-3. Assigns a status and logs warnings for gaps
-4. Writes `missing_docs_report.csv`
-
-### Status rules
-
-| Status | Meaning |
-|---|---|
-| `COMPLETE` | All required (`MITC`, `BR`) and optional (`TNC`, `LG`) docs present |
-| `PARTIAL` | Required docs present, but one or more optional docs missing |
-| `CRITICAL` | One or more required docs (`MITC` or `BR`) missing |
-| `NOT_FOUND` | No documents at all found for this card |
-
-### Console output
+When the pipeline runs, look for these tags to understand what's happening:
 
 ```
-[WARNING] Missing MITC for SBI Cashback
-[WARNING] Missing BR for AXIS Magnus
-[WARNING] Only [BR] found for KOTAK Flipkart — optional docs missing: TNC, LG
-[WARNING] No documents found at all for: HDFC MASTER
-```
-
-### Configuring required vs optional docs
-
-```python
-REQUIRED_DOCS = ["MITC", "BR"]   # CRITICAL if missing
-OPTIONAL_DOCS = ["TNC", "LG"]    # PARTIAL if missing
-```
-
-### Adding expected cards
-
-In `preprocess.py`, find `EXPECTED_CARDS`. The format is `"BANK_SHORT_CODE CardName"`. The short code must exactly match a key in `BANK_ALIASES`, and the card name must exactly match an entry in `CARDS`.
-
-```python
-EXPECTED_CARDS = [
-    "HDFC Millennia",
-    "BOB Eterna",
-    "HDFC MASTER",     # ← master doc entry
-    # add more here
-]
+[STEP 1] Extracting text from PDF
+[OCR]    Running OCR on ...              ← only for scanned PDFs
+[STEP 2] Rule result: bank=HDFC | card=Millennia | ...
+[FIX #2] Card narrowed: 'X' → 'Y'       ← cross-bank correction
+[STEP 3] LLM triggered — reasons: ...
+[LLM REQUEST]  Attempt 1/2 — model=mistral
+[LLM RESPONSE TIME]  12.4s
+[LLM OUTPUT]   bank=HDFC | card=Millennia | ...
+[LLM FAILURE]  Timeout after 120s        ← problem indicator
+[DECISION]     LLM OVERRIDE applied / Rules kept
+[STEP 4] Final result — ...
+[OUTPUT] Saved: HDFC_Millennia_MITC_2026.pdf
 ```
 
 ---
 
-## 13. The `needs_review` Folder
+## 9. Common Errors and Fixes
 
-A file is routed to `needs_review/` when **any** of the following are true:
+### LLM always times out
 
-- Overall confidence < 0.70
-- Bank name not detected
-- Card name not detected (and it is not a master document)
+**Symptom:** `[LLM FAILURE] Timeout after 120s` on every file
 
-Files in `needs_review/` are still renamed using whatever was detected, with `UNKNOWN_BANK` or `UNKNOWN_CARD` as placeholders.
+**Causes and fixes:**
 
-### What to do with these files
+1. **Ollama is not running:**
+   ```bash
+   ollama serve
+   ```
+   Check that `http://localhost:11434` is reachable in your browser.
 
-1. Open `summary.csv` and filter `Status = NEEDS_REVIEW`
-2. Read the `Reason` column to understand why detection failed
-3. Open `preprocess_log.txt` and find the file's entry for full detail
-4. Fix the issue — either:
-   - Add the missing bank/card/signal phrase to the config, then re-run, or
-   - Manually rename and move the file to the correct `processed_docs/` subfolder
+2. **Mistral model is not downloaded:**
+   ```bash
+   ollama pull mistral
+   ```
 
----
+3. **Running on CPU (slow machine):**
+   Increase `REQUEST_TIMEOUT` in `llm_classifier.py`:
+   ```python
+   REQUEST_TIMEOUT = 180   # or 240 for very slow CPUs
+   ```
+   First-request latency on CPU can be 60–90 s due to model loading. Subsequent requests are faster.
 
-## 14. How to Modify Rules
+4. **Another process is using too much RAM:**
+   Mistral 7B requires ~5 GB of RAM. Close other heavy applications.
 
-All editable configuration is at the **top of `preprocess.py`** inside the section marked `USER EDITABLE CONFIGURATION`. Nothing below that marker needs to be changed for typical adjustments.
+5. **Test with a direct call:**
+   ```bash
+   ollama run mistral "classify this: HDFC Millennia MITC"
+   ```
+   If this works, the issue is with timeout configuration. If it hangs, Ollama itself has a problem.
 
-### Add a new bank
+### OCR not working on Windows
 
-```python
-BANK_ALIASES = {
-    ...
-    "MYNEWBANK": ["my new bank limited", "my new bank", "mnb"],
-}
-```
+**Symptom:** `[OCR] OCR failed` or `TesseractNotFoundError`
 
-Then add it to `EXPECTED_CARDS`:
-```python
-"MYNEWBANK SomeCard",
-```
+**Fix:**
+1. Download Tesseract from: https://github.com/UB-Mannheim/tesseract/wiki
+2. Install it and note the path (e.g. `C:\Program Files\Tesseract-OCR\`)
+3. Open `preprocess_with_llm.py`, find `TESSERACT_CMD` inside `_extract_with_ocr()`, and update it:
+   ```python
+   TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+   ```
+4. Re-run the pipeline
 
-### Add a new card
+### Wrong doc_type detected (MITC vs TNC vs BR)
 
-```python
-CARDS = [
-    "New Specific Card Name",   # ← add BEFORE any shorter name it contains
-    "New Card",
-    ...
-]
-```
+**Symptom:** A MITC document is classified as TNC
 
-### Add a master doc signal phrase
+**Diagnosis:** Run with `--debug` and check what text was extracted from the first 500 characters. If the header says "Terms and Conditions" but the body contains fee schedules, the title phrase detection is picking up the header.
 
-```python
-MASTER_DOC_SIGNALS = [
-    "applicable to all credit cards",
-    "your new phrase here",   # ← add here, case-insensitive
-]
-```
-
-### Add a bank to the collective docs list
-
-If you discover a new bank publishes collective documents, add its short code to `MASTER_DOC_BANKS` (informational) and add its `EXPECTED_CARDS` entry:
-
-```python
-MASTER_DOC_BANKS = ["HDFC", "SBI", ..., "MYNEWBANK"]
-
-# In EXPECTED_CARDS:
-"MYNEWBANK MASTER",
-```
-
-### Add keywords for a document type
-
-```python
-MITC_KEYWORDS = [
-    "interest rate", "annual fee", ...,
-    "processing fee",   # ← add here
-]
-```
-
-### Add a title/header phrase for a document type
-
+**Fix:** Add the specific header phrase from that PDF to `MITC_TITLE_PHRASES` in `preprocess.py`:
 ```python
 MITC_TITLE_PHRASES = [
     "most important terms",
-    "mitc",
-    "schedule of charges",   # ← add here
+    "your new phrase here",   # ← add here
+    ...
 ]
 ```
 
-### Add a completely new document type
+### Card detected from wrong bank (e.g. SBI_Millennia)
 
-1. Add `FD_KEYWORDS = ["fee schedule", "tariff card", ...]`
-2. Add `FD_TITLE_PHRASES = ["schedule of fees and charges", ...]`
-3. Inside `detect_doc_type()`, add `"FD"` to the `title_hits` and `kw_data` dicts
+**Symptom:** A file ends up as `SBI_Millennia_BR_2026.pdf` but should be `SBI_Cashback_BR_2026.pdf`
 
-### Change the confidence threshold
+**Cause:** The word "Millennia" appeared somewhere in the SBI document body (e.g. in a comparison table), and was matched before "Cashback".
 
+**Fix (automatic):** The `_narrow_card_to_bank()` function in `preprocess_with_llm.py` should catch this. If it's still wrong, check that the card is in `BANK_CARDS["SBI"]` and not listed in another bank's entry.
+
+**Fix (manual):** Add the card to the correct bank in `BANK_CARDS`:
 ```python
-CONFIDENCE_THRESHOLD = 0.70   # increase = stricter, decrease = more lenient
-```
-
-### Change the default year
-
-```python
-DEFAULT_YEAR = "2026"   # used when no year is found in the document text
-```
-
-### Change how many pages are read
-
-```python
-PAGE_TIERS = [3, 5, 10]   # default
-PAGE_TIERS = [5, 10, 20]  # more thorough, slower
-```
-
----
-
-## 15. Troubleshooting
-
-### No PDF library found
-
-**Error:** `No PDF library found.`
-
-**Fix:**
-```bash
-pip install pdfplumber
-# or
-pip install pymupdf
-```
-
----
-
-### Running `python` opens the Microsoft Store instead
-
-**Symptom:** On PowerShell, `python` triggers the Store popup and nothing happens.
-
-**Fix (Option 1 — permanent):** Open Windows Settings → search "Manage app execution aliases" → turn OFF both Python entries.
-
-**Fix (Option 2 — immediate):** Use `py` instead of `python`:
-```bash
-py data_pipeline\preprocess.py
-```
-
----
-
-### No text extracted from PDF
-
-**Symptom:** Files go to `needs_review/` with no bank/card detected.
-
-**Cause:** The PDF is scanned (image-only, no embedded text layer).
-
-**Fix:** pdfplumber and PyMuPDF cannot read scanned images. Use an OCR tool such as `pytesseract` or Adobe Acrobat to convert the PDF to a text-searchable version first, then re-run.
-
----
-
-### Bank not detected
-
-**Symptom:** `Bank: NOT FOUND` in `summary.csv`.
-
-**Fix:** The bank name in the PDF text doesn't match any phrase in `BANK_ALIASES`. Open `preprocess_log.txt`, find the file, and check what text was extracted. Then add the phrase you see in the PDF to the correct bank's alias list:
-
-```python
-BANK_ALIASES = {
-    "HDFC": ["hdfc bank ltd", "hdfc bank", "hdfc", "new phrase from pdf"],
+BANK_CARDS = {
+    "SBI": ["Cashback", "Elite", "your_new_card", ...],
 }
 ```
 
----
+### Master document classified as specific card
 
-### Card not detected
+**Symptom:** `HDFC_MASTER_MITC_2026.pdf` becomes `HDFC_Infinia_MITC_2026.pdf`
 
-**Symptom:** `Card: NOT FOUND` or `UNKNOWN_CARD` in filename.
+**Cause:** The master signal phrase from that specific PDF is not in `MASTER_DOC_SIGNALS`.
 
-**Possible causes:**
-1. The card name isn't in the `CARDS` list — add it
-2. A shorter card name matched before the correct one — check ordering rules
-
----
-
-### Collective document wrongly matched to a specific card
-
-**Symptom:** An HDFC common MITC is being named `HDFC_Infinia_MITC_2024.pdf` instead of `HDFC_MASTER_MITC_2024.pdf`.
-
-**Fix:** The master signal phrase from that specific PDF isn't in `MASTER_DOC_SIGNALS`. Run with `--debug` to see the extracted text, find the phrase that indicates it's a collective document, and add it:
-
+**Fix:** Run with `--debug`, find the header text, and add the collective signal phrase to `preprocess.py`:
 ```python
 MASTER_DOC_SIGNALS = [
     "applicable to all credit cards",
-    "the phrase you found in the pdf",   # ← add here
+    "the phrase from your pdf",   # ← add here
 ]
 ```
 
----
+### Bank not detected
 
-### Wrong document type detected
+**Symptom:** `Bank: NOT FOUND` in `summary.csv`, file goes to `needs_review/`
 
-**Symptom:** A MITC document is classified as TNC.
-
-**Fix:** Add stronger signals for MITC — either a title phrase or more keywords:
-
+**Fix:** Run with `--debug`. Find the bank name as it appears in the PDF text, then add it to `BANK_ALIASES` in `preprocess.py`:
 ```python
-MITC_TITLE_PHRASES = ["most important terms", "mitc", "your title here"]
-MITC_KEYWORDS      = ["interest rate", "annual fee", ..., "your keyword"]
+BANK_ALIASES = {
+    "HDFC": ["hdfc bank ltd", "hdfc bank", "the phrase from your pdf", "hdfc"],
+}
 ```
 
----
+### No text extracted from PDF
 
-### Files not appearing in `processed_docs/`
+**Symptom:** File goes to `needs_review/` with empty bank/card detection, OCR message appears
 
-**Check 1:** Are you running in `--dry-run` mode? Dry-run logs actions but copies nothing.
+**Cause 1:** The PDF is a scanned image with no embedded text layer.
+**Fix:** Install pytesseract and the Tesseract binary (see Setup Step 4). The OCR fallback will activate automatically.
 
-**Check 2:** Did the file go to `needs_review/` instead? Check `summary.csv`.
-
-**Check 3:** Was it detected as a master doc? Look for a `BANK_MASTER/` subfolder.
-
----
-
-### `pandas` not installed
-
-The script falls back to Python's built-in `csv` module automatically. All CSV files will still be generated correctly. Install pandas only if you want faster CSV generation for very large datasets.
+**Cause 2:** PDF is encrypted or password-protected.
+**Fix:** Remove the password protection before placing the file in `raw_docs/`.
 
 ---
 
-### Windows path errors
+## 10. Troubleshooting Guide
 
-The script uses Python's `pathlib.Path` which handles Windows paths correctly. Always run from the project root:
+### Diagnostic checklist — when a file goes to `needs_review/`
 
-```bash
-cd C:\Users\YourName\projects\credit_card_pipeline
-python data_pipeline\preprocess.py
-```
+1. Open `data/logs/summary.csv` and find the file row
+2. Read the `Reason` column
+3. Open `data/logs/preprocess_log.txt` and find the file section for full detail
+4. Run with `--debug` to see the extracted text:
+   ```bash
+   python data_pipeline/preprocess_with_llm.py --debug --no-llm
+   ```
+5. Based on what you see:
+   - If text is empty → OCR issue (see above)
+   - If bank is wrong → add phrase to `BANK_ALIASES`
+   - If card is wrong → check `BANK_CARDS` in `preprocess_with_llm.py`
+   - If doc_type is wrong → add phrase to relevant `_TITLE_PHRASES` or `_KEYWORDS` in `preprocess.py`
+
+### How to debug LLM decisions
+
+1. Run the standalone LLM test:
+   ```bash
+   python data_pipeline/llm_classifier.py
+   ```
+2. Check `data/logs/hybrid_classification_log.txt` after a run
+3. Look for `[LLM REQUEST]`, `[LLM RESPONSE TIME]`, and `[LLM FAILURE]` in console output
+4. If LLM is overriding good rule results too often, increase `LLM_OVERRIDE_MARGIN` in `preprocess_with_llm.py`:
+   ```python
+   LLM_OVERRIDE_MARGIN = 0.15   # default is 0.10
+   ```
+
+### Performance tips
+
+- Run `--no-llm` first to check rule-based results, then re-run with LLM for only the files in `needs_review/`
+- LLM is only called for files that fail the multi-condition trigger (low confidence or missing fields)
+- On GPU, Mistral inference takes 2–5 s per file. On CPU, 15–60 s per file (first call may be slower due to model loading)
+- The pipeline processes files sequentially — parallel processing is not currently implemented
+
+### File already processed but classification was wrong
+
+1. Delete the wrongly classified file from `processed_docs/`
+2. Fix the configuration (add missing phrase, update `BANK_CARDS`, etc.)
+3. Re-run — the duplicate detection will skip files that already exist, so only the deleted file will be reprocessed
+
+### Configuration reference
+
+All user-editable settings are at the top of `preprocess.py`. Key settings:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `CONFIDENCE_THRESHOLD` | `0.70` | Files below this go to `needs_review/` |
+| `DEFAULT_YEAR` | `"2026"` | Year used when not found in PDF |
+| `PAGE_TIERS` | `[3, 5, 10]` | Pages read per attempt (do not reduce) |
+| `REQUIRED_DOCS` | `["MITC", "BR"]` | Docs needed for COMPLETE coverage status |
+| `OPTIONAL_DOCS` | `["TNC", "LG"]` | Docs needed for PARTIAL vs COMPLETE |
+
+LLM-specific settings in `llm_classifier.py`:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `REQUEST_TIMEOUT` | `120` | Seconds to wait for Ollama response |
+| `MAX_RETRIES` | `2` | Number of retry attempts on failure |
+| `LLM_TEXT_WINDOW` | `2000` | Characters sent to the LLM |
+| `OLLAMA_MODEL` | `"mistral"` | Model name (must be pulled first) |
 
 ---
 
-*Last updated to reflect: BANK_ALIASES short code mapping, Master/Collective document detection, adaptive page reading, coverage validation with MASTER entries, and updated log formats.*
+*Last updated: March 2026*
