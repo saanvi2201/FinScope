@@ -4,14 +4,17 @@
 # Entry point for the Behavioral Agent.
 # Exposes: generate_user_profile(user_text, user_profile) → structured dict
 #
+# FIXES APPLIED:
+#   [Issue #6]  Invalid input handling → propagates input_valid flag
+#   [Issue #7]  State persistence → all state is local, reset per call
+#
 # Full pipeline:
-# TEXT → PARSER → ESTIMATOR → WEIGHT CALC → SPEND VECTOR → OUTPUT
+#   TEXT → PARSER → ESTIMATOR → WEIGHT CALC → SPEND VECTOR → OUTPUT
 #
 # ⚠️ IMPORTANT: Changing category names will break Simulation Agent
 # Output schema is FIXED — do not rename keys without updating Simulation Agent.
 #
-# Run instructions:
-#   pip install streamlit
+# Run:
 #   python test_behavior.py          # CLI tests
 #   streamlit run app.py             # Streamlit UI
 # =============================================================================
@@ -28,16 +31,15 @@ from utils import (
 )
 from parser import parse_user_text
 from estimator import estimate_total_spend
-from defaults import CATEGORIES  # IMPORTANT: Changing category names will break Simulation Agent
+from defaults import CATEGORIES, DEFAULT_WEIGHTS, WEIGHT_FLOOR
+# ⚠️ IMPORTANT: Changing category names will break Simulation Agent
 
-# Initialize logging
 setup_logging("INFO")
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
 # generate_user_profile()
-# THE MAIN FUNCTION — called by Agent 2 (Knowledge) and Agent 3 (Simulation)
 # =============================================================================
 def generate_user_profile(
     user_text: str,
@@ -47,16 +49,17 @@ def generate_user_profile(
     Converts natural language user input into a structured financial profile.
 
     Args:
-        user_text    (str):  Raw user input. REQUIRED.
+        user_text    (str):  Raw user input. Required.
         user_profile (dict): Optional demographic context.
                              Keys: "age" (int), "income" (int), "profession" (str)
 
     Returns:
-        Strictly typed dict with keys:
-        - spend_vector      : {category: int (₹/month)}
-        - category_weights  : {category: float (0.0–1.0, sums to 1.0)}
-        - tags              : [str]
-        - confidence        : float (0.0–1.0)
+        {
+            "spend_vector":      {category: int (₹/month)},
+            "category_weights":  {category: float (0.0–1.0, sums to 1.0)},
+            "tags":              [str],
+            "confidence":        float (0.0–1.0),
+        }
 
     Integration contract:
         All category keys in spend_vector and category_weights are FIXED.
@@ -64,17 +67,15 @@ def generate_user_profile(
                       "groceries", "entertainment", "utilities", "other"]
         ⚠️ IMPORTANT: Changing category names will break Simulation Agent
     """
-
     logger.info("=" * 70)
     logger.info("BEHAVIORAL AGENT: generate_user_profile() called")
     logger.info(f"user_text    = '{user_text}'")
     logger.info(f"user_profile = {user_profile}")
     logger.info("=" * 70)
 
-    # Validate input
-    if not user_text or not isinstance(user_text, str):
-        logger.error("BEHAVIORAL AGENT: user_text is empty or invalid!")
-        return _empty_profile()
+    # FIX [Issue #7]: All intermediate state is initialized fresh here.
+    # There are no module-level globals that persist between calls.
+    # Every variable below is scoped to this function invocation.
 
     # ── STAGE 1: PARSE TEXT ───────────────────────────────────────────────────
     logger.info("STAGE 1: Parsing user text...")
@@ -85,15 +86,20 @@ def generate_user_profile(
     keywords_found      = parse_result["keywords_found"]
     is_cold_start       = parse_result["is_cold_start"]
     cold_start_persona  = parse_result["cold_start_persona"]
+    input_valid         = parse_result["input_valid"]   # FIX [Issue #6]
 
-    logger.info(f"STAGE 1 DONE: profession='{profession}', cold_start={is_cold_start}")
-    logger.info(f"  keywords_found: {keywords_found}")
-    logger.info(f"  raw category_scores: {category_scores}")
+    logger.info(f"STAGE 1 DONE: profession='{profession}', cold_start={is_cold_start}, valid={input_valid}")
+    logger.info(f"  keywords_found:    {keywords_found}")
+    logger.info(f"  category_scores:   {category_scores}")
+
+    # FIX [Issue #6]: If input is completely invalid, return safe zero profile immediately.
+    if not input_valid:
+        logger.warning("BEHAVIORAL AGENT: Invalid input detected — returning empty profile.")
+        return _empty_profile()
 
     # ── STAGE 2: ESTIMATE TOTAL SPEND ─────────────────────────────────────────
     logger.info("STAGE 2: Estimating total monthly spend...")
-    spend_estimate = estimate_total_spend(user_profile, profession)
-
+    spend_estimate      = estimate_total_spend(user_profile, profession)
     total_spend         = spend_estimate["total_spend"]
     estimation_method   = spend_estimate["estimation_method"]
     confidence_bonus    = spend_estimate["confidence_bonus"]
@@ -116,7 +122,8 @@ def generate_user_profile(
         keywords_found,
         is_cold_start,
         estimation_method,
-        confidence_bonus
+        confidence_bonus,
+        input_valid=input_valid,    # FIX [Issue #6, #9]
     )
     logger.info(f"STAGE 5 DONE: confidence = {confidence}")
 
@@ -127,28 +134,18 @@ def generate_user_profile(
         profession,
         is_cold_start,
         cold_start_persona,
-        keywords_found
+        keywords_found,
+        input_valid=input_valid,    # FIX [Issue #6]
     )
     logger.info(f"STAGE 6 DONE: tags = {tags}")
 
     # ── FINAL OUTPUT ──────────────────────────────────────────────────────────
-    # IMPORTANT: Changing category names will break Simulation Agent
+    # ⚠️ IMPORTANT: Changing category names will break Simulation Agent
     output = {
-        "spend_vector": spend_vector,
-        # Format: {category: int} — monthly ₹ spend per category
-        # Consumed directly by Simulation Agent for Net Value calculation
-
+        "spend_vector":     spend_vector,
         "category_weights": normalized_weights,
-        # Format: {category: float} — proportional weights summing to 1.0
-        # Used for relative importance scoring
-
-        "tags": tags,
-        # Format: [str] — interpretable labels for reasoning
-        # Used by Recommendation Agent for explanation generation
-
-        "confidence": confidence,
-        # Format: float 0.0–1.0
-        # Used by Validation stage to flag low-confidence profiles
+        "tags":             tags,
+        "confidence":       confidence,
     }
 
     logger.info("=" * 70)
@@ -164,20 +161,19 @@ def generate_user_profile(
 
 # =============================================================================
 # _empty_profile()
-# Reason: Returns safe zero-value output on invalid input.
-#         Prevents downstream agents from crashing on bad input.
+# FIX [Issue #6]: Guaranteed-safe zero-state return for invalid inputs.
+#                 Fully resets — no contamination from any previous call.
 # =============================================================================
 def _empty_profile() -> dict:
     """
-    Fallback output for empty/invalid input.
-    All zeros with minimum WEIGHT_FLOOR applied.
+    Fallback output for invalid/empty input.
+    Returns all-zero spend_vector and baseline default weights.
+    confidence = 0.0 signals to downstream agents to skip/flag this profile.
     """
-    from defaults import DEFAULT_WEIGHTS, WEIGHT_FLOOR
-
     return {
+        # ⚠️ IMPORTANT: Changing category names will break Simulation Agent
         "spend_vector":     {cat: 0 for cat in CATEGORIES},
         "category_weights": {cat: DEFAULT_WEIGHTS.get(cat, WEIGHT_FLOOR) for cat in CATEGORIES},
         "tags":             ["invalid_input"],
         "confidence":       0.0,
-        # Reason: 0.0 confidence signals to downstream agents to skip/flag this profile
     }
